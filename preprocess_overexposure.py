@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""Preprocess images to repair overexposed pixels using a perceptual rule.
-
-Algorithm: Detect overexposed/glare regions and darken them by 10% while preserving color.
-For blown-out whites, sample nearby colors. Apply bilateral filtering for smooth blending.
-
-Usage:
-  python tools/preprocess_overexposure.py --input_dir example_images --output_dir tmp_preproc --mode darken
-"""
 import argparse
 from pathlib import Path
 import numpy as np
@@ -16,7 +8,6 @@ import cv2
 
 
 def compute_Y_S(arr):
-    """arr: HxWx3 uint8 or float (0..255 or 0..1). Return Y (0..1), S (0..1), with arr in 0..255 scale."""
     a = arr.astype('float32')
     if a.max() <= 1.1:
         a = a * 255.0
@@ -32,8 +23,259 @@ def compute_Y_S(arr):
     return Y, S
 
 
+def poisson_blend(source, target, mask, method='mixed'):
+    """
+    Poisson blending for seamless integration.
+    method: 'mixed' (default) uses mixed gradients, 'normal' uses source gradients only
+    """
+    if not np.any(mask):
+        return target
+    
+    # Convert mask to uint8
+    mask_uint8 = (mask > 0.5).astype('uint8') * 255
+    
+    # Find center of mask for seamlessClone
+    ys, xs = np.nonzero(mask > 0.5)
+    if len(ys) == 0:
+        return target
+    
+    center = (int(np.mean(xs)), int(np.mean(ys)))
+    
+    # Ensure proper data types
+    source_uint8 = np.clip(source, 0, 255).astype('uint8')
+    target_uint8 = np.clip(target, 0, 255).astype('uint8')
+    
+    try:
+        if method == 'mixed':
+            result = cv2.seamlessClone(source_uint8, target_uint8, mask_uint8, center, cv2.MIXED_CLONE)
+        else:
+            result = cv2.seamlessClone(source_uint8, target_uint8, mask_uint8, center, cv2.NORMAL_CLONE)
+        return result.astype('float32')
+    except:
+        # Fallback to regular blending if seamlessClone fails
+        return target
+
+
+def multiscale_blend(source, target, mask, levels=3):
+    """
+    Multi-scale Laplacian pyramid blending for natural texture preservation.
+    """
+    if not np.any(mask):
+        return target
+    
+    source_uint8 = np.clip(source, 0, 255).astype('uint8')
+    target_uint8 = np.clip(target, 0, 255).astype('uint8')
+    mask_float = mask.astype('float32')
+    
+    # Build Gaussian pyramids for source and target
+    src_pyr = [source_uint8.astype('float32')]
+    tgt_pyr = [target_uint8.astype('float32')]
+    mask_pyr = [mask_float]
+    
+    for i in range(levels - 1):
+        src_pyr.append(cv2.pyrDown(src_pyr[-1]))
+        tgt_pyr.append(cv2.pyrDown(tgt_pyr[-1]))
+        mask_down = cv2.pyrDown(mask_pyr[-1])
+        mask_pyr.append(mask_down)
+    
+    # Build Laplacian pyramids
+    src_lap = []
+    tgt_lap = []
+    
+    for i in range(levels - 1):
+        expanded = cv2.pyrUp(src_pyr[i + 1])
+        if expanded.shape[:2] != src_pyr[i].shape[:2]:
+            expanded = cv2.resize(expanded, (src_pyr[i].shape[1], src_pyr[i].shape[0]))
+        src_lap.append(src_pyr[i] - expanded)
+        
+        expanded = cv2.pyrUp(tgt_pyr[i + 1])
+        if expanded.shape[:2] != tgt_pyr[i].shape[:2]:
+            expanded = cv2.resize(expanded, (tgt_pyr[i].shape[1], tgt_pyr[i].shape[0]))
+        tgt_lap.append(tgt_pyr[i] - expanded)
+    
+    src_lap.append(src_pyr[-1])
+    tgt_lap.append(tgt_pyr[-1])
+    
+    # Blend Laplacian pyramids
+    blended_pyr = []
+    for i in range(levels):
+        mask_3c = mask_pyr[i]
+        if len(mask_3c.shape) == 2:
+            mask_3c = mask_3c[..., np.newaxis]
+        blended = src_lap[i] * mask_3c + tgt_lap[i] * (1.0 - mask_3c)
+        blended_pyr.append(blended)
+    
+    # Reconstruct from pyramid
+    result = blended_pyr[-1]
+    for i in range(levels - 2, -1, -1):
+        expanded = cv2.pyrUp(result)
+        if expanded.shape[:2] != blended_pyr[i].shape[:2]:
+            expanded = cv2.resize(expanded, (blended_pyr[i].shape[1], blended_pyr[i].shape[0]))
+        result = expanded + blended_pyr[i]
+    
+    return np.clip(result, 0, 255).astype('float32')
+
+
+def adaptive_feather_mask(mask, source, target, min_sigma=2.0, max_sigma=15.0):
+    """
+    Create adaptive feathering based on local texture complexity.
+    Areas with more texture get less feathering, flat areas get more.
+    """
+    # Compute texture complexity using Laplacian variance
+    source_gray = cv2.cvtColor(np.clip(source, 0, 255).astype('uint8'), cv2.COLOR_RGB2GRAY)
+    target_gray = cv2.cvtColor(np.clip(target, 0, 255).astype('uint8'), cv2.COLOR_RGB2GRAY)
+    
+    lap_src = cv2.Laplacian(source_gray, cv2.CV_64F)
+    lap_tgt = cv2.Laplacian(target_gray, cv2.CV_64F)
+    
+    # Compute local variance
+    texture_map = np.abs(lap_src) + np.abs(lap_tgt)
+    texture_map = cv2.GaussianBlur(texture_map, (15, 15), 3.0)
+    
+    # Normalize to [0, 1]
+    texture_norm = (texture_map - texture_map.min()) / (texture_map.max() - texture_map.min() + 1e-8)
+    
+    # Less texture -> more feathering (higher sigma)
+    adaptive_sigma = max_sigma - (max_sigma - min_sigma) * texture_norm
+    
+    # Create distance transform
+    mask_bool = mask > 0.5
+    dist_transform = ndimage.distance_transform_edt(mask_bool)
+    
+    # Apply adaptive feathering
+    feathered = np.zeros_like(mask, dtype='float32')
+    
+    # Vectorized adaptive gaussian falloff
+    ys, xs = np.nonzero(mask_bool)
+    for y, x in zip(ys, xs):
+        d = dist_transform[y, x]
+        sigma = adaptive_sigma[y, x]
+        feathered[y, x] = np.exp(-(d ** 2) / (2 * sigma ** 2))
+    
+    # Smooth the feathered mask
+    feathered = cv2.GaussianBlur(feathered, (15, 15), 3.0)
+    
+    return np.clip(feathered, 0, 1)
+
+
+def gradient_domain_blend(source, target, mask, bandwidth=10):
+    """
+    Gradient-domain blending that preserves gradients from surrounding areas.
+    """
+    mask_bool = mask > 0.5
+    if not np.any(mask_bool):
+        return target
+    
+    result = target.copy()
+    
+    # Erode mask to get interior region
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bandwidth*2+1, bandwidth*2+1))
+    mask_eroded = cv2.erode((mask_bool.astype('uint8') * 255), kernel, iterations=1) > 0
+    
+    # Boundary is the difference
+    boundary = mask_bool & (~mask_eroded)
+    
+    if not np.any(boundary):
+        return target
+    
+    # For each channel, blend gradients
+    for c in range(3):
+        src_chan = source[..., c]
+        tgt_chan = target[..., c]
+        
+        # Compute gradients
+        src_gx = cv2.Sobel(src_chan.astype('float32'), cv2.CV_32F, 1, 0, ksize=3)
+        src_gy = cv2.Sobel(src_chan.astype('float32'), cv2.CV_32F, 0, 1, ksize=3)
+        tgt_gx = cv2.Sobel(tgt_chan.astype('float32'), cv2.CV_32F, 1, 0, ksize=3)
+        tgt_gy = cv2.Sobel(tgt_chan.astype('float32'), cv2.CV_32F, 0, 1, ksize=3)
+        
+        # Use stronger gradients (mixed gradients approach)
+        mixed_gx = np.where(np.abs(src_gx) > np.abs(tgt_gx), src_gx, tgt_gx)
+        mixed_gy = np.where(np.abs(src_gy) > np.abs(tgt_gy), src_gy, tgt_gy)
+        
+        # Smooth transition at boundary
+        boundary_float = boundary.astype('float32')
+        boundary_smooth = cv2.GaussianBlur(boundary_float, (bandwidth*2+1, bandwidth*2+1), bandwidth/2.0)
+        
+        # Blend gradients
+        final_gx = mixed_gx * mask_bool.astype('float32') + tgt_gx * (1.0 - mask_bool.astype('float32'))
+        final_gy = mixed_gy * mask_bool.astype('float32') + tgt_gy * (1.0 - mask_bool.astype('float32'))
+        
+        # Reconstruct from gradients (simplified - using source values in interior)
+        result[..., c][mask_eroded] = src_chan[mask_eroded]
+    
+    # Smooth boundaries
+    result = cv2.bilateralFilter(np.clip(result, 0, 255).astype('uint8'), 9, 75, 75).astype('float32')
+    
+    return result
+
+
+def enhanced_smooth_blend(original, reconstructed, mask, mode='auto', smooth_sigma=2.0, feather_sigma=5.0):
+    """
+    Enhanced blending with multiple techniques.
+    mode: 'poisson', 'multiscale', 'gradient', 'adaptive', or 'auto' (tries best method)
+    """
+    if not np.any(mask):
+        return original
+    
+    mask_bool = mask > 0.5
+    
+    if mode == 'auto':
+        # Automatically choose best method based on mask characteristics
+        mask_area = np.sum(mask_bool) / float(mask_bool.size)
+        
+        if mask_area < 0.01:  # Small regions - use Poisson
+            mode = 'poisson'
+        elif mask_area > 0.3:  # Large regions - use multiscale
+            mode = 'multiscale'
+        else:  # Medium regions - use adaptive
+            mode = 'adaptive'
+    
+    if mode == 'poisson':
+        # Try mixed clone first, fallback to normal clone
+        result = poisson_blend(reconstructed, original, mask_bool, method='mixed')
+        if np.array_equal(result, original):  # If failed
+            result = poisson_blend(reconstructed, original, mask_bool, method='normal')
+    
+    elif mode == 'multiscale':
+        # Multi-scale Laplacian blending
+        result = multiscale_blend(reconstructed, original, mask_bool, levels=4)
+    
+    elif mode == 'gradient':
+        # Gradient-domain blending
+        result = gradient_domain_blend(reconstructed, original, mask_bool, bandwidth=12)
+    
+    elif mode == 'adaptive':
+        # Adaptive feathering + alpha blending
+        feather_mask = adaptive_feather_mask(mask_bool.astype('float32'), reconstructed, original)
+        
+        # Smooth reconstructed
+        smooth_recon = np.zeros_like(reconstructed)
+        for c in range(3):
+            smooth_recon[..., c] = ndimage.gaussian_filter(reconstructed[..., c], sigma=smooth_sigma)
+        
+        # Alpha blend with adaptive mask
+        alpha = feather_mask[..., np.newaxis]
+        result = smooth_recon * alpha + original * (1.0 - alpha)
+    
+    else:
+        # Fallback to original simple method
+        smooth_recon = np.zeros_like(reconstructed)
+        for c in range(3):
+            smooth_recon[..., c] = ndimage.gaussian_filter(reconstructed[..., c], sigma=smooth_sigma)
+        
+        dist_transform = ndimage.distance_transform_edt(mask_bool)
+        max_dist = np.max(dist_transform[mask_bool]) if np.any(mask_bool) else 1.0
+        feather = 1.0 - np.exp(-(dist_transform / feather_sigma) ** 2)
+        feather = np.clip(feather, 0, 1)
+        
+        alpha = feather[..., np.newaxis]
+        result = smooth_recon * alpha + original * (1.0 - alpha)
+    
+    return np.clip(result, 0, 255)
+
+
 def reconstruct_overexposed(arr, over_mask, radius=7, sigma=None):
-    """Reconstruct overexposed pixels using distance-weighted average of nearby non-over pixels."""
     h, w = over_mask.shape
     out = arr.copy()
     if sigma is None:
@@ -72,7 +314,6 @@ def reconstruct_overexposed(arr, over_mask, radius=7, sigma=None):
 
 
 def color_propagate_inpaint(arr, over_mask, radius=10):
-    """Inpaint overexposed regions using color propagation from non-saturated neighbors."""
     arr_out = arr.copy()
     inv_mask = ~over_mask
     
@@ -90,10 +331,6 @@ def color_propagate_inpaint(arr, over_mask, radius=10):
 
 
 def classify_glare_vs_white(arr, over_mask, min_glare_size=0.005):
-    """Classify saturated regions into glare (small, halo-like) vs white objects (large, flat).
-    
-    Key insight: Regions with high clipping (>= 250) are overexposure, not white objects.
-    """
     h, w = over_mask.shape
     total_pixels = h * w
     min_size = max(50, int(min_glare_size * total_pixels))
@@ -114,14 +351,12 @@ def classify_glare_vs_white(arr, over_mask, min_glare_size=0.005):
             glare_mask[comp_mask] = True
             continue
         
-        # NEW: Check if region is clipped (saturated channels at 250+)
-        # This distinguishes overexposure from intentional white objects
         R = arr_f[comp_mask, 0]
         G = arr_f[comp_mask, 1]
         B = arr_f[comp_mask, 2]
         max_c = np.maximum.reduce([R, G, B])
         
-        clipped_ratio = np.sum(max_c >= 250) / comp_size
+        clipped_ratio = np.sum(max_c >= 252) / comp_size
         if clipped_ratio >= 0.3:
             glare_mask[comp_mask] = True
             continue
@@ -158,41 +393,65 @@ def classify_glare_vs_white(arr, over_mask, min_glare_size=0.005):
     return glare_mask, white_mask
 
 
-def smooth_blend(original_arr, reconstructed_arr, over_mask, smooth_sigma=2.0, feather_sigma=5.0):
-    """Blend reconstructed pixels with gaussian smoothing and edge-aware feathering."""
-    sm = np.zeros_like(reconstructed_arr)
-    for c in range(3):
-        sm[..., c] = ndimage.gaussian_filter(reconstructed_arr[..., c], sigma=smooth_sigma)
+def robust_clip_repair(arr, mask):
+    mask_bool = (mask > 0.5)
+    if not np.any(mask_bool):
+        return arr.astype('uint8')
 
-    Y_recon, _ = compute_Y_S(reconstructed_arr)
-    gx = ndimage.sobel(Y_recon, axis=1)
-    gy = ndimage.sobel(Y_recon, axis=0)
-    grad = np.hypot(gx, gy)
-    grad_mean = np.mean(grad[over_mask]) + 1e-8
-    
-    over_mask_uint8 = over_mask.astype('uint8')
-    dist_from_edge, _ = ndimage.distance_transform_edt(over_mask, return_indices=True)
-    
-    max_dist = np.max(dist_from_edge[over_mask]) + 1e-8
-    feather_weight = 1.0 - np.exp(-(dist_from_edge / feather_sigma) ** 2)
-    feather_weight = np.clip(feather_weight, 0.0, 1.0)
-    
-    grad_norm = grad / (grad_mean + 1e-8)
-    grad_weight = 1.0 - np.exp(-grad_norm)
-    grad_weight = np.clip(grad_weight, 0.0, 1.0)
-    
-    alpha = feather_weight * (0.5 + 0.5 * grad_weight)
-    alpha = np.clip(alpha, 0.0, 1.0)
+    arr_uint8 = np.clip(arr, 0, 255).astype('uint8')
+    valid_boundary_found = False
+    result = arr_uint8.copy()
 
-    out = original_arr.copy()
-    am = alpha[..., None]
-    blended = am * reconstructed_arr + (1.0 - am) * sm
-    out[over_mask] = blended[over_mask]
-    return out
+    search_radii = [10, 20, 30, 40, 50]
+    mask_uint8 = mask_bool.astype('uint8')
+
+    for radius in search_radii:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+        mask_dilated = cv2.dilate(mask_uint8, kernel, iterations=1)
+        boundary = (mask_dilated > 0) & (mask_uint8 == 0)
+
+        if not np.any(boundary):
+            continue
+
+        boundary_pixels = arr[boundary]
+        if boundary_pixels.size == 0:
+            continue
+
+        max_vals = np.max(boundary_pixels, axis=1)
+        non_white_ratio = np.sum(max_vals < 248) / float(len(max_vals))
+
+        if non_white_ratio > 0.2:
+            try:
+                inpaint_mask = (mask_uint8 * 255).astype('uint8')
+                inpainted = cv2.inpaint(arr_uint8, inpaint_mask, inpaintRadius=min(radius, 25), flags=cv2.INPAINT_NS)
+                result = inpainted
+                valid_boundary_found = True
+                break
+            except Exception:
+                valid_boundary_found = False
+                continue
+
+    if not valid_boundary_found:
+        hsv = cv2.cvtColor(arr_uint8, cv2.COLOR_RGB2HSV).astype('float32')
+        dist_mask = ndimage.distance_transform_edt(mask_bool)
+        max_dist = np.max(dist_mask[mask_bool]) if np.any(mask_bool) else 1.0
+        dist_norm = np.clip(dist_mask / (max_dist + 1e-8), 0, 1)
+        reduction = 0.25 + 0.15 * dist_norm
+        V = hsv[..., 2]
+        V_new = V.copy()
+        V_new[mask_bool] = V[mask_bool] * (1.0 - reduction[mask_bool])
+        hsv[..., 2] = np.clip(V_new, 0, 255)
+        result = cv2.cvtColor(np.clip(hsv, 0, 255).astype('uint8'), cv2.COLOR_HSV2RGB)
+
+    try:
+        result = cv2.bilateralFilter(result, d=7, sigmaColor=40, sigmaSpace=40)
+    except Exception:
+        pass
+
+    return result.astype('uint8')
 
 
 def pyramid_inpaint(arr_uint8, mask_uint8, levels=3, base_radius=3):
-    """Coarse-to-fine inpainting using OpenCV inpaint at multiple scales."""
     if levels <= 1:
         return cv2.inpaint(arr_uint8, mask_uint8, base_radius, cv2.INPAINT_TELEA)
 
@@ -229,8 +488,6 @@ def pyramid_inpaint(arr_uint8, mask_uint8, levels=3, base_radius=3):
 
 
 def apply_clahe(img_uint8):
-    """Apply Contrast Limited Adaptive Histogram Equalization in LAB space.
-    Redistributes brightness within glare regions while preserving local contrast."""
     lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     lab[..., 0] = clahe.apply(lab[..., 0])
@@ -238,11 +495,8 @@ def apply_clahe(img_uint8):
 
 
 def apply_multi_scale_retinex(img_uint8, scales=None):
-    """Multi-Scale Retinex: separates illumination from reflectance.
-    Helps recover detail in bright areas without creating uniform gray patches.
-    Uses faster, smaller scales for reasonable processing time."""
     if scales is None:
-        scales = [15, 80]  # Reduced from [15, 80, 250] for speed
+        scales = [15, 80]
     
     img_float = img_uint8.astype('float32') + 1.0
     msr = np.zeros_like(img_float)
@@ -257,45 +511,208 @@ def apply_multi_scale_retinex(img_uint8, scales=None):
 
 
 def blend_enhancement(original, enhanced, mask_soft_norm, blend_factor=0.6):
-    """Blend original image with enhanced version using soft mask.
-    This prevents hard edges at mask boundaries."""
     blend_weight = blend_factor * mask_soft_norm[..., None]
     blended = original * (1.0 - blend_weight) + enhanced.astype('float32') * blend_weight
     return np.clip(blended, 0, 255).astype('float32')
 
 
-def process_image(path, out_dir, radius=7, smooth_sigma=2.0, feather_sigma=5.0, min_glare_size=0.005, pyramid_levels=3, mode='inpaint', darken_frac=0.35,
-                  base_reduction=0.12, extra_reduction=0.20, severity_start=220.0, severity_range=35.0, blend_factor=0.85, gamma_exponent=1.2, reduction_cap=0.75):
+def smooth_blend(original_arr, reconstructed_arr, over_mask, smooth_sigma=2.0, feather_sigma=5.0, blend_method='auto'):
+    """Enhanced version using smart blending techniques"""
+    # Smooth the reconstruction first
+    smoothed = np.zeros_like(reconstructed_arr)
+    for c in range(3):
+        smoothed[..., c] = ndimage.gaussian_filter(reconstructed_arr[..., c], sigma=smooth_sigma)
+    
+    # Apply smart blending
+    result = smart_blend(original_arr, smoothed, over_mask, method=blend_method)
+    
+    return result
+
+
+def simple_inpaint_reconstruction(arr, mask, radius=20):
+    arr_uint8 = np.clip(arr, 0, 255).astype('uint8')
+    mask_uint8 = (mask.astype('uint8') * 255)
+    
+    inpainted = cv2.inpaint(arr_uint8, mask_uint8, radius, cv2.INPAINT_TELEA)
+    
+    return inpainted
+
+
+def smart_blend(original, reconstructed, mask, method='auto'):
+    mask_bool = mask > 0.5
+    if not np.any(mask_bool):
+        return original
+    
+    if method == 'auto':
+        mask_area = np.sum(mask_bool) / float(mask_bool.size)
+        labeled, n_regions = ndimage.label(mask_bool)
+        
+        if n_regions > 5 or mask_area < 0.01:
+            method = 'poisson'
+        elif mask_area > 0.3:
+            method = 'multiscale'
+        else:
+            method = 'adaptive'
+    
+    if method == 'poisson':
+        result = poisson_blend(reconstructed, original, mask_bool)
+        if np.array_equal(result, original):
+            result = adaptive_feather_blend(reconstructed, original, mask_bool)
+    elif method == 'multiscale':
+        result = multiscale_blend(reconstructed, original, mask_bool, levels=4)
+    elif method == 'adaptive':
+        result = adaptive_feather_blend(reconstructed, original, mask_bool)
+    elif method == 'gradient':
+        result = gradient_domain_blend(reconstructed, original, mask_bool)
+    else:
+        result = adaptive_feather_blend(reconstructed, original, mask_bool)
+    
+    return result
+
+
+def classify_glare_type(arr, mask):
+    """
+    Classify overexposed pixels as:
+    - Pure white clipping (no hue, essentially colorless)
+    - Colored glare (has detectable hue through RGB imbalance)
+    Returns two masks: white_clip, colored_glare
+    """
+    arr_f = arr.astype('float32')
+    R = arr_f[..., 0]
+    G = arr_f[..., 1]
+    B = arr_f[..., 2]
+    
+    max_c = np.maximum.reduce([R, G, B])
+    min_c = np.minimum.reduce([R, G, B])
+    
+    rgb_diff = max_c - min_c
+    hue_strength = rgb_diff / (max_c + 1e-8)
+    
+    white_clip = mask & (hue_strength < 0.08) & (max_c >= 245)
+    colored_glare = mask & (hue_strength >= 0.08)
+    
+    return white_clip, colored_glare
+
+
+def adaptive_feather_blend(source, target, mask, min_feather=2, max_feather=15):
+    mask_bool = mask > 0.5
+    if not np.any(mask_bool):
+        return target
+    
+    src_gray = cv2.cvtColor(np.clip(source, 0, 255).astype('uint8'), cv2.COLOR_RGB2GRAY)
+    tgt_gray = cv2.cvtColor(np.clip(target, 0, 255).astype('uint8'), cv2.COLOR_RGB2GRAY)
+    
+    lap_src = np.abs(cv2.Laplacian(src_gray, cv2.CV_64F))
+    lap_tgt = np.abs(cv2.Laplacian(tgt_gray, cv2.CV_64F))
+    texture_map = lap_src + lap_tgt
+    texture_map = cv2.GaussianBlur(texture_map, (15, 15), 3.0)
+    
+    texture_norm = (texture_map - texture_map.min()) / (texture_map.max() - texture_map.min() + 1e-8)
+    
+    dist_map = ndimage.distance_transform_edt(mask_bool)
+    max_dist = np.max(dist_map[mask_bool]) if np.any(mask_bool) else 1.0
+    
+    sigma_map = max_feather - (max_feather - min_feather) * texture_norm
+    
+    alpha = np.zeros_like(mask, dtype='float32')
+    alpha[mask_bool] = np.exp(-(dist_map[mask_bool] ** 2) / (2 * sigma_map[mask_bool] ** 2))
+    alpha = cv2.GaussianBlur(alpha, (15, 15), 3.0)
+    alpha = np.clip(alpha, 0, 1)
+    
+    result = source * alpha[..., np.newaxis] + target * (1 - alpha[..., np.newaxis])
+    return np.clip(result, 0, 255).astype('float32')
+
+
+def process_overexposed_hybrid(arr, mask, mode_per_pixel):
+    """
+    Hybrid processing: inpaint colored glare, darken pure white clipping.
+    mode_per_pixel: 0=no change, 1=inpaint colored, 2=darken white
+    """
+    arr_uint8 = np.clip(arr, 0, 255).astype('uint8')
+    result = arr.copy()
+    
+    inpaint_mask = (mode_per_pixel == 1).astype('float32')
+    darken_mask = (mode_per_pixel == 2).astype('float32')
+    
+    if np.any(mode_per_pixel == 1):
+        inpaint_bool = mode_per_pixel == 1
+        inpaint_mask_uint8 = (inpaint_bool.astype('uint8') * 255)
+        
+        if inpaint_bool.any():
+            radius = 20
+            inpainted = cv2.inpaint(arr_uint8, inpaint_mask_uint8, radius, cv2.INPAINT_TELEA)
+            result[inpaint_bool] = inpainted.astype('float32')[inpaint_bool]
+    
+    if np.any(mode_per_pixel == 2):
+        darken_bool = mode_per_pixel == 2
+        
+        darken_f = arr_uint8.astype('float32')
+        hsv = cv2.cvtColor(np.clip(darken_f, 0, 255).astype('uint8'), cv2.COLOR_RGB2HSV).astype('float32')
+        
+        V = hsv[..., 2]
+        V_new = V * 0.7
+        
+        hsv[..., 2] = np.clip(V_new, 0, 255)
+        darkened_rgb = cv2.cvtColor(np.clip(hsv, 0, 255).astype('uint8'), cv2.COLOR_HSV2RGB).astype('float32')
+        
+        result[darken_bool] = darkened_rgb[darken_bool]
+    
+    return result
+    mask_bool = mask > 0.5
+    if not np.any(mask_bool):
+        return target
+    
+    src_gray = cv2.cvtColor(np.clip(source, 0, 255).astype('uint8'), cv2.COLOR_RGB2GRAY)
+    tgt_gray = cv2.cvtColor(np.clip(target, 0, 255).astype('uint8'), cv2.COLOR_RGB2GRAY)
+    
+    lap_src = np.abs(cv2.Laplacian(src_gray, cv2.CV_64F))
+    lap_tgt = np.abs(cv2.Laplacian(tgt_gray, cv2.CV_64F))
+    texture_map = lap_src + lap_tgt
+    texture_map = cv2.GaussianBlur(texture_map, (15, 15), 3.0)
+    
+    texture_norm = (texture_map - texture_map.min()) / (texture_map.max() - texture_map.min() + 1e-8)
+    
+    dist_map = ndimage.distance_transform_edt(mask_bool)
+    max_dist = np.max(dist_map[mask_bool]) if np.any(mask_bool) else 1.0
+    
+    sigma_map = max_feather - (max_feather - min_feather) * texture_norm
+    
+    alpha = np.zeros_like(mask, dtype='float32')
+    alpha[mask_bool] = np.exp(-(dist_map[mask_bool] ** 2) / (2 * sigma_map[mask_bool] ** 2))
+    alpha = cv2.GaussianBlur(alpha, (15, 15), 3.0)
+    alpha = np.clip(alpha, 0, 1)
+    
+    result = source * alpha[..., np.newaxis] + target * (1 - alpha[..., np.newaxis])
+    return np.clip(result, 0, 255).astype('float32')
+
+
+def process_image(path, out_dir, radius=7, smooth_sigma=2.0, feather_sigma=5.0, min_glare_size=0.005, 
+                  pyramid_levels=3, mode='hybrid', blend_method='auto', darken_frac=0.35,
+                  base_reduction=0.12, extra_reduction=0.20, severity_start=220.0, severity_range=35.0, 
+                  blend_factor=0.85, gamma_exponent=1.2, reduction_cap=0.75):
     img = Image.open(path).convert('RGB')
     arr = np.asarray(img).astype('float32')
     Y, S = compute_Y_S(arr)
     S_TH = np.exp(2.4 * (Y - 1.0))
-    # Base perceptual overexposure detection (luminance + low saturation)
     over_mask = (Y > 0.95) & (S < S_TH)
-    # Also include very high channel values (near clipping) or extremely high luminance
     max_chan = np.maximum.reduce([arr[..., 0], arr[..., 1], arr[..., 2]])
-    over_mask = over_mask | (max_chan >= 245) | (Y > 0.98)
+    over_mask = over_mask | (max_chan >= 250) | (Y > 0.99)
     
-    # Detect large bright regions (suns, sunsets) via morphology and local luminance
     total_pixels = arr.shape[0] * arr.shape[1]
-    bright_mask = max_chan >= 235
+    bright_mask = max_chan >= 245
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     bright_opened = cv2.morphologyEx((bright_mask.astype('uint8') * 255), cv2.MORPH_OPEN, kernel, iterations=1)
     bright_labeled, ncomp = ndimage.label((bright_opened > 0))
     
-    # For each large bright component, check if local mean Y is high (likely sun/highlight)
     for comp_id in range(1, ncomp + 1):
         comp_mask = bright_labeled == comp_id
         comp_area = np.sum(comp_mask)
-        # Lower threshold: detect components >= 0.1% of image
         if comp_area / float(total_pixels) >= 0.001:
             mean_y = np.mean(Y[comp_mask])
             mean_max = np.mean(max_chan[comp_mask])
-            # If component is very bright, mark as overexposed
-            if mean_y > 0.90 or mean_max > 230:
+            if mean_y > 0.95 or mean_max > 240:
                 over_mask[comp_mask] = True
     
-    # Morphological dilation to grow overexposed regions and catch halos
     kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     over_mask = cv2.dilate((over_mask.astype('uint8') * 255), kernel_dilate, iterations=2) > 0
 
@@ -304,76 +721,58 @@ def process_image(path, out_dir, radius=7, smooth_sigma=2.0, feather_sigma=5.0, 
     if np.any(glare_mask):
         glare_mask_uint8 = (glare_mask.astype('uint8') * 255)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        glare_mask_dilated = cv2.dilate(glare_mask_uint8, kernel, iterations=1)
-        glare_mask_soft = cv2.GaussianBlur(glare_mask_dilated, (7, 7), sigmaX=2.0, sigmaY=2.0)
+        glare_mask_dilated = cv2.dilate(glare_mask_uint8, kernel, iterations=2)
+        glare_mask_soft = cv2.GaussianBlur(glare_mask_dilated, (15, 15), sigmaX=5.0, sigmaY=5.0)
         glare_mask_soft_norm = glare_mask_soft.astype('float32') / 255.0
 
         if mode == 'darken':
-            # Aggressive darkening strategy:
-            # 1) Apply CLAHE to bring out local contrast
-            # 2) Blend enhanced image with original using soft mask
-            # 3) Apply stronger per-pixel HSV-based Value reduction proportional to clipping severity
-            # 4) Apply an additional gamma compression on very bright pixels and bilateral smoothing
             arr_uint8 = np.clip(arr, 0, 255).astype('uint8')
             final = arr_uint8.copy().astype('float32')
             pixel_changes = []
 
-            # 1) CLAHE enhancement
             clahe_img = apply_clahe(arr_uint8)
-
-            # 2) Blend CLAHE with original using soft mask to avoid hard edges
             final = blend_enhancement(final, clahe_img, glare_mask_soft_norm, blend_factor=blend_factor)
 
-            # 3) Compute clipping severity from original image (0..1)
             R_o = arr_uint8[..., 0].astype('float32')
             G_o = arr_uint8[..., 1].astype('float32')
             B_o = arr_uint8[..., 2].astype('float32')
             max_val = np.maximum.reduce([R_o, G_o, B_o])
-            # severity: start at severity_start -> 0, severity_start+severity_range -> 1
             severity = np.clip((max_val - severity_start) / severity_range, 0.0, 1.0)
 
             mask_strength = glare_mask_soft_norm.astype('float32')
-
-            # reduction fraction per-pixel: base + extra*severity scaled by mask strength
             reduction = (base_reduction + extra_reduction * severity) * mask_strength
             reduction = np.clip(reduction, 0.0, reduction_cap)
 
-            # Convert blended result to HSV and reduce Value channel only
             final_uint8 = np.clip(final, 0, 255).astype('uint8')
-            hsv = cv2.cvtColor(final_uint8, cv2.COLOR_RGB2HSV).astype('float32')
-            V = hsv[..., 2]
-
-            # Apply per-pixel multiplicative reduction on V
-            V_new = V * (1.0 - reduction)
-
-            # Adaptive gamma compression on very bright values to further tame highlights (milder)
-            gamma_mask = V_new > 235
-            if np.any(gamma_mask):
-                # milder gamma for very bright pixels
-                V_new[gamma_mask] = 255.0 * np.power((V_new[gamma_mask] / 255.0), float(gamma_exponent))
-
-            hsv[..., 2] = np.clip(V_new, 0, 255)
-            final_rgb = cv2.cvtColor(np.clip(hsv, 0, 255).astype('uint8'), cv2.COLOR_HSV2RGB).astype('float32')
-
-            # 4) STRICT per-channel cap: ensure no channel reduces by more than 10% of original
             orig_rgb = arr_uint8.astype('float32')
             
-            # Compute minimum allowed value per channel: 90% of original
-            min_allowed = 0.90 * orig_rgb
+            hsv = cv2.cvtColor(final_uint8, cv2.COLOR_RGB2HSV).astype('float32')
+            H = hsv[..., 0]
+            S = hsv[..., 1]
+            V = hsv[..., 2]
             
-            # Apply hard floor: never go below 90% of original
-            final_capped = np.maximum(final_rgb, min_allowed)
-            final = final_capped
-
-            # Apply bilateral smoothing BEFORE final clamping to preserve the cap
-            final_uint8 = np.clip(final, 0, 255).astype('uint8')
-            final_filtered = cv2.bilateralFilter(final_uint8, d=9, sigmaColor=75, sigmaSpace=75)
-            final = final_filtered.astype('float32')
+            V_new = V * (1.0 - reduction)
+            gamma_mask = V_new > 235
+            if np.any(gamma_mask):
+                V_new[gamma_mask] = 255.0 * np.power((V_new[gamma_mask] / 255.0), float(gamma_exponent))
             
-            # RE-APPLY cap after bilateral filter to ensure it's not violated by filter artifacts
-            final = np.maximum(final, min_allowed)
+            S_enhanced = np.clip(S * (1.0 + reduction * 0.3), 0, 255)
+            
+            hsv_darkened = np.stack([H, S_enhanced, V_new], axis=-1)
+            final_rgb = cv2.cvtColor(np.clip(hsv_darkened, 0, 255).astype('uint8'), cv2.COLOR_HSV2RGB).astype('float32')
+            
+            min_allowed = 0.85 * orig_rgb
+            final_rgb = np.maximum(final_rgb, min_allowed)
+            
+            final_uint8 = np.clip(final_rgb, 0, 255).astype('uint8')
+            final_filtered = cv2.bilateralFilter(final_uint8, d=11, sigmaColor=100, sigmaSpace=100)
+            final_float_smooth = final_filtered.astype('float32')
+            
+            transition_zone = (mask_strength > 0.05) & (mask_strength < 0.95)
+            blending_weight = np.where(transition_zone, 0.5, 0.85)
+            final = final_float_smooth * blending_weight[..., None] + final_rgb * (1.0 - blending_weight[..., None])
+            final = np.clip(final, 0, 255)
 
-            # Log sample pixel changes for analysis
             mask_idx = mask_strength > 0.01
             if np.any(mask_idx):
                 ys, xs = np.nonzero(mask_idx)
@@ -383,7 +782,6 @@ def process_image(path, out_dir, radius=7, smooth_sigma=2.0, feather_sigma=5.0, 
                     new = tuple(np.round(final[y, x]).astype(int))
                     pixel_changes.append({'y': y, 'x': x, 'orig_rgb': orig, 'new_rgb': new, 'type': 'aggressive_darken'})
             
-            # Save pixel change log
             if pixel_changes:
                 log_path = Path(out_dir) / 'pixel_changes' / (Path(path).stem + '_changes.txt')
                 log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -393,10 +791,31 @@ def process_image(path, out_dir, radius=7, smooth_sigma=2.0, feather_sigma=5.0, 
                         orig = change['orig_rgb']
                         new = change['new_rgb']
                         f.write(f"{change['y']},{change['x']},{orig[0]},{orig[1]},{orig[2]},{new[0]},{new[1]},{new[2]},{change['type']}\n")
+        elif mode == 'hybrid':
+            white_clip, colored_glare = classify_glare_type(arr, glare_mask_soft_norm > 0.5)
+            
+            mode_map = np.zeros(arr.shape[:2], dtype='uint8')
+            mode_map[colored_glare] = 1
+            mode_map[white_clip] = 2
+            
+            final = process_overexposed_hybrid(arr, glare_mask_soft_norm > 0.5, mode_map)
+            
+            if np.any(colored_glare):
+                colored_mask = colored_glare.astype('float32')
+                colored_smooth = cv2.GaussianBlur((colored_mask * 255).astype('uint8'), (15, 15), 5.0)
+                colored_smooth_norm = colored_smooth.astype('float32') / 255.0
+                final = final * colored_smooth_norm[..., None] + arr * (1.0 - colored_smooth_norm[..., None])
+            
+            if np.any(white_clip):
+                white_smooth = cv2.GaussianBlur((white_clip.astype('uint8') * 255), (15, 15), 5.0)
+                white_smooth_norm = white_smooth.astype('float32') / 255.0
+                final = final * white_smooth_norm[..., None] + arr * (1.0 - white_smooth_norm[..., None])
         else:
-            # Default: use color propagation inpaint
-            inpainted = color_propagate_inpaint(arr, glare_mask_soft_norm > 0.5, radius=10)
-            final = smooth_blend(arr, inpainted.astype('float32'), glare_mask_soft_norm > 0.5, smooth_sigma=smooth_sigma, feather_sigma=feather_sigma)
+            # Use enhanced blending with robust repair
+            repaired = robust_clip_repair(arr, glare_mask_soft_norm > 0.5)
+            final = smooth_blend(arr, repaired.astype('float32'), glare_mask_soft_norm > 0.5, 
+                               smooth_sigma=smooth_sigma, feather_sigma=feather_sigma, 
+                               blend_method=blend_method)
     else:
         final = arr.copy()
 
@@ -423,13 +842,14 @@ def main():
     parser.add_argument('--feather_sigma', type=float, default=5.0, help='Distance sigma for feathering blend at patch boundaries')
     parser.add_argument('--min_glare_size', type=float, default=0.005, help='Min fraction of image area to classify as glare')
     parser.add_argument('--pyramid_levels', type=int, default=3, help='Number of pyramid levels for coarse-to-fine inpainting')
-    parser.add_argument('--mode', type=str, choices=['inpaint','darken'], default='inpaint', help='Processing mode: inpaint (default) or darken')
+    parser.add_argument('--mode', type=str, choices=['inpaint','darken','hybrid'], default='hybrid', help='Processing mode: inpaint, darken, or hybrid (default)')
+    parser.add_argument('--blend_method', type=str, choices=['auto','poisson','multiscale','adaptive','gradient'], 
+                        default='auto', help='Blending method: auto (default), poisson, multiscale, adaptive, or gradient')
     parser.add_argument('--darken_frac', type=float, default=0.35, help='Fraction to darken overexposed areas (0..1)')
-    # Darkening tuning parameters
-    parser.add_argument('--base_reduction', type=float, default=0.12, help='Base per-pixel reduction fraction (0..1)')
-    parser.add_argument('--extra_reduction', type=float, default=0.20, help='Extra per-pixel reduction scaled by severity (0..1)')
-    parser.add_argument('--severity_start', type=float, default=220.0, help='Start of severity mapping (pixel value)')
-    parser.add_argument('--severity_range', type=float, default=35.0, help='Range over which severity maps to 0..1')
+    parser.add_argument('--base_reduction', type=float, default=0.06, help='Base per-pixel reduction fraction (0..1)')
+    parser.add_argument('--extra_reduction', type=float, default=0.10, help='Extra per-pixel reduction scaled by severity (0..1)')
+    parser.add_argument('--severity_start', type=float, default=235.0, help='Start of severity mapping (pixel value)')
+    parser.add_argument('--severity_range', type=float, default=20.0, help='Range over which severity maps to 0..1')
     parser.add_argument('--blend_factor', type=float, default=0.85, help='Blend factor for CLAHE/enhanced image')
     parser.add_argument('--gamma_exponent', type=float, default=1.2, help='Gamma exponent for very bright value compression')
     parser.add_argument('--reduction_cap', type=float, default=0.75, help='Maximum allowed reduction fraction')
@@ -445,8 +865,13 @@ def main():
 
     for p in files:
         try:
-            process_image(p, output_dir, radius=args.radius, smooth_sigma=args.smooth_sigma, feather_sigma=args.feather_sigma, min_glare_size=args.min_glare_size, pyramid_levels=args.pyramid_levels, mode=args.mode, darken_frac=args.darken_frac,
-                      base_reduction=args.base_reduction, extra_reduction=args.extra_reduction, severity_start=args.severity_start, severity_range=args.severity_range, blend_factor=args.blend_factor, gamma_exponent=args.gamma_exponent, reduction_cap=args.reduction_cap)
+            process_image(p, output_dir, radius=args.radius, smooth_sigma=args.smooth_sigma, 
+                        feather_sigma=args.feather_sigma, min_glare_size=args.min_glare_size, 
+                        pyramid_levels=args.pyramid_levels, mode=args.mode, blend_method=args.blend_method,
+                        darken_frac=args.darken_frac, base_reduction=args.base_reduction, 
+                        extra_reduction=args.extra_reduction, severity_start=args.severity_start, 
+                        severity_range=args.severity_range, blend_factor=args.blend_factor, 
+                        gamma_exponent=args.gamma_exponent, reduction_cap=args.reduction_cap)
             print('Preprocessed', p.name)
         except Exception as e:
             print('Failed', p.name, 'error:', e)
