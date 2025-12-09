@@ -162,6 +162,50 @@ def process_image(path, out_dir, smooth_sigma=2.0, min_glare_size=0.005):
     out_name = Path(path).stem + '_preproc.png'
     Image.fromarray(np.clip(final, 0, 255).astype('uint8')).save(processed_dir / out_name)
 
+def exposure_fix(image_bgr, smooth_sigma=2.0, min_glare_size=0.005):
+    """
+    Fix overexposure for a single image.
+    Input:
+        image_bgr : HxWx3 uint8 BGR (from cv2.imread, etc.)
+    Output:
+        fixed_bgr : HxWx3 uint8 BGR
+    """
+    # BGR -> RGB to match original PIL code
+    img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+    # Original code used a PIL Image; here we just work with the RGB array
+    arr = img_rgb.astype('float32')  # same as original `arr = np.asarray(img).astype('float32')`
+
+    # ----- original logic -----
+    Y, S = compute_Y_S(arr)
+    S_TH = np.exp(2.4 * (Y - 1.0))
+    over_mask = (Y > 0.95) & (S < S_TH)
+
+    glare_mask, white_mask = classify_glare_vs_white(
+        arr, over_mask, min_glare_size=min_glare_size
+    )
+
+    if np.any(glare_mask):
+        glare_mask_uint8 = (glare_mask.astype('uint8') * 255)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        glare_mask_dilated = cv2.dilate(glare_mask_uint8, kernel, iterations=1)
+
+        arr_uint8 = np.clip(arr, 0, 255).astype('uint8')
+        inpainted = cv2.inpaint(arr_uint8, glare_mask_dilated, 3, cv2.INPAINT_TELEA)
+
+        final = smooth_blend(
+            arr, inpainted.astype('float32'),
+            glare_mask, smooth_sigma=smooth_sigma
+        )
+    else:
+        final = arr.copy()
+
+    # Preserve white regions
+    final[white_mask] = arr[white_mask]
+
+    # Clip & convert to uint8 RGB
+    final = np.clip(final, 0, 255).astype('uint8')
+    return final
 
 def main():
     parser = argparse.ArgumentParser(description='Preprocess images to repair overexposure (output corrected image only)')
