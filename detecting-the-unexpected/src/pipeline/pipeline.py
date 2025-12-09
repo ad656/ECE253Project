@@ -1,4 +1,3 @@
-
 import logging
 log = logging.getLogger('exp')
 import numpy as np
@@ -64,7 +63,7 @@ def default_collate_edited(batch):
 		return batch
 	elif isinstance(elem, collections_abc.Mapping):
 		return {key: default_collate_edited([d[key] for d in batch]) for key in elem}
-	elif isinstance(elem, collections.Sequence):
+	elif isinstance(elem, collections_abc.Sequence):
 		transposed = zip(*batch)
 		return [default_collate_edited(samples) for samples in transposed]
 

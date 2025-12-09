@@ -29,6 +29,9 @@ from ..a05_road_rec_baseline.experiments import Exp0525_RoadReconstructionRBM_Lo
 from .E0_article_evaluation import get_anomaly_net
 from .E1_plot_utils import TrImgGrid, TrBlend, tr_draw_anomaly_contour, draw_rocinfos
 
+from types import SimpleNamespace
+from src.a01_sem_seg.deeplab_mobilenet_cityscapes_wrapper import DeepLabV3PlusMobileNetCityscapes
+
 # class EvaluationSemSeg(Evaluation):
 # 	def __init__(self, exp):
 # 		super().__init__(exp)
@@ -427,7 +430,11 @@ class EvaluationDetectingUnexpected:
 		dset.discover()
 		dset.flush_hdf5_files()
 		dset.set_channels_enabled()
-		results = Frame.frame_list_apply(tr_roc, dset.frames, ret_frames=True, n_proc=8, batch=8)
+		# results = Frame.frame_list_apply(tr_roc, dset.frames, ret_frames=True, n_proc=0, batch=8)
+		results = []
+		for fr in dset.frames:
+			tr_roc(frame=fr, dset=dset)
+			results.append(fr)
 		
 		# Extract info from conf mats, such as fp / tp
 		rocinfo_by_variant = {}
@@ -541,6 +548,10 @@ class DiscrepancyJointPipeline:
 	def init_semseg(self):
 		self.exp_sem_seg = ExpPSP_EnsebleReuse()
 		self.exp_sem_seg.init_net('eval')
+		# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+		# seg_model = DeepLabV3PlusMobileNetCityscapes(device=device)
+		# seg_model.eval()
+		# self.exp_sem_seg = SimpleNamespace(net_mod=seg_model)
 
 	def tr_apply_semseg(self, image, **_):
 

@@ -13,6 +13,7 @@ import numpy as np
 # or whatever the root of that repo is.
 
 from src.external import network  # this is the repo that has modeling.py / main.py
+import torch.nn.functional as F
 
 
 class DeepLabV3PlusMobileNetCityscapes(nn.Module):
@@ -122,7 +123,34 @@ class DeepLabV3PlusMobileNetCityscapes(nn.Module):
             out = out["out"]
 
         return out
-        
+
+    @torch.no_grad()
+    def forward_multisample(self, image, n_samples: int = 8):
+        """
+        Bayes-style interface used by ExpSemSegBayes.
+
+        Expected output format:
+            {
+                'mean': [B, C, H, W]  # class probabilities
+                'var':  [B, C, H, W]  # per-class variance (we set it to ~0 here)
+            }
+
+        For now we just do a single deterministic forward pass and set var to 0.
+        That’s enough to make the evaluation pipeline run.
+        """
+        self.eval()  # make sure we're in eval mode
+
+        # image is expected as [B, 3, H, W] on the correct device
+        logits = self.forward(image)                 # [B, C, H, W]
+        prob   = F.softmax(logits, dim=1)            # [B, C, H, W]
+
+        var = torch.zeros_like(prob)                 # no uncertainty for MobileNet
+
+        return {
+            "mean": prob,
+            "var":  var,
+        }
+    
     @torch.no_grad()
     def predict_from_pil(self, img_pil: Image.Image) -> torch.Tensor:
         """
