@@ -5,7 +5,130 @@ import cv2
 import matplotlib.pyplot as plt
 from DCP.dehaze import DCP
 from non_local_dehazing.haze_line import haze_line
-from Simplified_trad_method import exposure_fix
+
+import Simplified_trad_method as stm
+
+
+def exposure_fix(img_bgr, mode='hybrid',
+                 base_reduction=0.12, extra_reduction=0.20,
+                 severity_start=220.0, severity_range=35.0,
+                 blend_factor=0.85, gamma_exponent=1.2, reduction_cap=0.75,
+                 smooth_sigma=2.0, feather_sigma=5.0, min_glare_size=0.005):
+    """
+    Hybrid exposure fix (R2). Accepts BGR uint8 (as from cv2.imread/resize),
+    returns RGB float32 scaled to [0,1].
+
+    Uses functions from Simplified_trad_method (stm).
+    """
+
+    if img_bgr.dtype != np.uint8:
+        img_bgr = np.clip(img_bgr * 255.0, 0, 255).astype('uint8')
+    arr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype('float32')
+
+    Y, S = stm.compute_Y_S(arr)
+    S_TH = np.exp(2.4 * (Y - 1.0))
+    over_mask = (Y > 0.95) & (S < S_TH)
+    max_chan = np.maximum.reduce([arr[..., 0], arr[..., 1], arr[..., 2]])
+    over_mask = over_mask | (max_chan >= 250) | (Y > 0.99)
+
+    total_pixels = arr.shape[0] * arr.shape[1]
+    bright_mask = max_chan >= 245
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    bright_opened = cv2.morphologyEx((bright_mask.astype('uint8') * 255),
+                                     cv2.MORPH_OPEN, kernel, iterations=1)
+    bright_labeled, ncomp = stm.ndimage.label((bright_opened > 0))
+
+    for comp_id in range(1, ncomp + 1):
+        comp_mask = bright_labeled == comp_id
+        comp_area = np.sum(comp_mask)
+        if comp_area / float(total_pixels) >= 0.001:
+            mean_y = np.mean(Y[comp_mask])
+            mean_max = np.mean(max_chan[comp_mask])
+            if mean_y > 0.95 or mean_max > 240:
+                over_mask[comp_mask] = True
+
+    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    over_mask = cv2.dilate((over_mask.astype('uint8') * 255), kernel_dilate, iterations=2) > 0
+
+
+    glare_mask, white_mask = stm.classify_glare_vs_white(arr, over_mask, min_glare_size=min_glare_size)
+
+    if np.any(glare_mask):
+
+        glare_mask_uint8 = (glare_mask.astype('uint8') * 255)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        glare_mask_dilated = cv2.dilate(glare_mask_uint8, kernel, iterations=2)
+        glare_mask_soft = cv2.GaussianBlur(glare_mask_dilated, (15, 15), sigmaX=5.0, sigmaY=5.0)
+        glare_mask_soft_norm = glare_mask_soft.astype('float32') / 255.0
+
+
+        if mode == 'darken':
+            arr_uint8 = np.clip(arr, 0, 255).astype('uint8')
+            final = arr_uint8.copy().astype('float32')
+
+            clahe_img = stm.apply_clahe(arr_uint8)
+            final = stm.blend_enhancement(final, clahe_img, glare_mask_soft_norm, blend_factor=blend_factor)
+
+            R_o = arr_uint8[..., 0].astype('float32')
+            G_o = arr_uint8[..., 1].astype('float32')
+            B_o = arr_uint8[..., 2].astype('float32')
+            max_val = np.maximum.reduce([R_o, G_o, B_o])
+            severity = np.clip((max_val - severity_start) / severity_range, 0.0, 1.0)
+
+            mask_strength = glare_mask_soft_norm.astype('float32')
+            reduction = (base_reduction + extra_reduction * severity) * mask_strength
+            reduction = np.clip(reduction, 0.0, reduction_cap)
+
+            final_uint8 = np.clip(final, 0, 255).astype('uint8')
+            orig_rgb = arr_uint8.astype('float32')
+
+            hsv = cv2.cvtColor(final_uint8, cv2.COLOR_RGB2HSV).astype('float32')
+            H = hsv[..., 0]
+            S_chan = hsv[..., 1]
+            V = hsv[..., 2]
+
+            V_new = V * (1.0 - reduction)
+            gamma_mask = V_new > 235
+            if np.any(gamma_mask):
+                V_new[gamma_mask] = 255.0 * np.power((V_new[gamma_mask] / 255.0), float(gamma_exponent))
+
+            S_enhanced = np.clip(S_chan * (1.0 + reduction * 0.3), 0, 255)
+
+            hsv_darkened = np.stack([H, S_enhanced, V_new], axis=-1)
+            final_rgb = cv2.cvtColor(np.clip(hsv_darkened, 0, 255).astype('uint8'),
+                                     cv2.COLOR_HSV2RGB).astype('float32')
+
+            min_allowed = 0.85 * orig_rgb
+            final_rgb = np.maximum(final_rgb, min_allowed)
+
+            final = final_rgb
+        else:
+
+            white_clip, colored_glare = stm.classify_glare_type(arr, glare_mask_soft_norm > 0.5)
+
+            mode_map = np.zeros(arr.shape[:2], dtype='uint8')
+            mode_map[colored_glare] = 1
+            mode_map[white_clip] = 2
+
+            final = stm.process_overexposed_hybrid(arr, glare_mask_soft_norm > 0.5, mode_map)
+
+            if np.any(colored_glare):
+                colored_mask = colored_glare.astype('float32')
+                colored_smooth = cv2.GaussianBlur((colored_mask * 255).astype('uint8'), (15, 15), 5.0)
+                colored_smooth_norm = colored_smooth.astype('float32') / 255.0
+                final = final * colored_smooth_norm[..., None] + arr * (1.0 - colored_smooth_norm[..., None])
+
+            if np.any(white_clip):
+                white_smooth = cv2.GaussianBlur((white_clip.astype('uint8') * 255), (15, 15), 5.0)
+                white_smooth_norm = white_smooth.astype('float32') / 255.0
+                final = final * white_smooth_norm[..., None] + arr * (1.0 - white_smooth_norm[..., None])
+    else:
+
+        final = arr.copy()
+
+    final_rgb_0_1 = np.clip(final, 0, 255).astype('float32') / 255.0
+
+    return final_rgb_0_1
 
 def _pad_to_pow2(img, levels):
     h, w = img.shape[:2]
@@ -92,10 +215,10 @@ def fuse_luminance_wavelet_dcp_exp(img_dcp, img_exp, levels=5, base_chroma='exp'
     H, W = L_dcp.shape
     L_fused = L_fused[:H, :W]
 
-    # clamp and cast to uint8
+
     L_fused_u8 = np.clip(L_fused, 0, 255).astype(np.uint8)
 
-    # --- choose base chroma (a,b) channels ---
+
     if base_chroma == 'exp':
         a_base, b_base = a_exp, b_exp
     else:
@@ -144,6 +267,7 @@ def main():
                 dehaze, _ = haze_line(resize_src)
 
             exposure_fixed = exposure_fix(resize_src)
+
             fused = fuse_luminance_wavelet_dcp_exp(
                 dehaze,
                 exposure_fixed,
@@ -151,10 +275,10 @@ def main():
                 base_chroma='exp'
             )
 
-            # result display
-            plt.subplot(2, 2, 1)   
+
+            plt.subplot(2, 2, 1)
             plt.title("Original")
-            plt.imshow(exposure_fixed) 
+            plt.imshow(exposure_fixed)
             plt.axis("off")
             plt.subplot(2, 2, 2)
             plt.title("Dehazed")
@@ -163,7 +287,7 @@ def main():
             plt.tight_layout()
             plt.subplot(2, 2, 3)
             plt.title("De-overexposure")
-            plt.imshow(exposure_fixed) 
+            plt.imshow(exposure_fixed)
             plt.axis("off")
             plt.subplot(2, 2, 4)
             plt.title("Fused result")
@@ -171,7 +295,7 @@ def main():
             plt.axis("off")
             plt.tight_layout()
             plt.show()
-    
+
             print('Processed', p.name)
         except Exception as e:
             print('Failed', p.name, 'error:', e)
