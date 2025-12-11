@@ -239,10 +239,21 @@ def resize(image, pixel_num = 1024*512):
     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return resized
 
+def save_rgb_float01_as_bgr_uint8(path, rgb_float01):
+    """
+    rgb_float01: H×W×3, float32/float64 in [0,1]
+    path: output file path (Path or str)
+    """
+    rgb_clipped = np.clip(rgb_float01 * 255.0, 0, 255).astype(np.uint8)
+    bgr = cv2.cvtColor(rgb_clipped, cv2.COLOR_RGB2BGR)
+    path = str(path)
+    cv2.imwrite(path, bgr)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_dir', required=True, help='Directory with input images')
     parser.add_argument('--output_dir', required=True, help='Directory to save augmented images')
+    parser.add_argument('--fusion', type=str, choices=['yes', 'no'], required=True, help='Save the fusion or resize image')
     parser.add_argument('--dehaze', type=str, choices=['dcp', 'hazeline'], help='method to dehaze', default='dcp')
     args = parser.parse_args()
 
@@ -257,8 +268,13 @@ def main():
         print('No images found in', input_dir)
 
     for p in files:
+        out_name = p.stem + ".webp"
+        out_path = output_dir / out_name
         src = cv2.imread(str(p))
         resize_src = resize(src)
+        if args.fusion == 'no':
+            cv2.imwrite(str(out_path), resize_src)
+            continue
         try:
             if args.dehaze == 'dcp':
                 dehaze = DCP(resize_src)
@@ -267,13 +283,13 @@ def main():
                 dehaze, _ = haze_line(resize_src)
 
             exposure_fixed = exposure_fix(resize_src)
-
             fused = fuse_luminance_wavelet_dcp_exp(
                 dehaze,
                 exposure_fixed,
                 levels=5,
                 base_chroma='exp'
             )
+            save_rgb_float01_as_bgr_uint8(out_path, fused)
 
 
             plt.subplot(2, 2, 1)
