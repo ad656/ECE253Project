@@ -250,6 +250,11 @@ class EvaluationDetectingUnexpected:
 
 	def run_semseg(self, dset, b_show=False):
 		pipe = self.exp_semseg.construct_default_pipeline('test')
+		if hasattr(pipe, "loader_args"):
+            # make sure we don't modify a shared dict by reference
+			pipe.loader_args = dict(pipe.loader_args)
+			pipe.loader_args["batch_size"] = 1
+			pipe.loader_args["shuffle"] = False
 
 		tr_out = self.exp_semseg.tr_out_for_eval_show if b_show else self.exp_semseg.tr_out_for_eval
 
@@ -268,6 +273,11 @@ class EvaluationDetectingUnexpected:
 
 	def run_gen_image(self, dset, b_show=False):
 		pipe = self.pix2pix.construct_pipeline()
+		if hasattr(pipe, "loader_args"):
+            # make sure we don't modify a shared dict by reference
+			pipe.loader_args = dict(pipe.loader_args)
+			pipe.loader_args["batch_size"] = 1
+			pipe.loader_args["shuffle"] = False
 		
 		pipe.tr_input += [
 			TrChannelLoad(self.storage['pred_labels_trainIds'], 'pred_labels_trainIds'),
@@ -312,6 +322,11 @@ class EvaluationDetectingUnexpected:
 			exp = detector_exp_or_name
 
 		pipe = exp.construct_default_pipeline('test')
+		if hasattr(pipe, "loader_args"):
+            # make sure we don't modify a shared dict by reference
+			pipe.loader_args = dict(pipe.loader_args)
+			pipe.loader_args["batch_size"] = 1
+			pipe.loader_args["shuffle"] = False
 
 		pipe.tr_input += [
 			TrChannelLoad(self.storage['pred_labels_trainIds'], 'pred_labels_trainIds'),
