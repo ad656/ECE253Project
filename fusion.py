@@ -5,7 +5,6 @@ import cv2
 import matplotlib.pyplot as plt
 from DCP.dehaze import DCP
 from non_local_dehazing.haze_line import haze_line
-
 import Simplified_trad_method as stm
 
 
@@ -14,12 +13,6 @@ def exposure_fix(img_bgr, mode='hybrid',
                  severity_start=220.0, severity_range=35.0,
                  blend_factor=0.85, gamma_exponent=1.2, reduction_cap=0.75,
                  smooth_sigma=2.0, feather_sigma=5.0, min_glare_size=0.005):
-    """
-    Hybrid exposure fix (R2). Accepts BGR uint8 (as from cv2.imread/resize),
-    returns RGB float32 scaled to [0,1].
-
-    Uses functions from Simplified_trad_method (stm).
-    """
 
     if img_bgr.dtype != np.uint8:
         img_bgr = np.clip(img_bgr * 255.0, 0, 255).astype('uint8')
@@ -50,22 +43,18 @@ def exposure_fix(img_bgr, mode='hybrid',
     kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     over_mask = cv2.dilate((over_mask.astype('uint8') * 255), kernel_dilate, iterations=2) > 0
 
-
     glare_mask, white_mask = stm.classify_glare_vs_white(arr, over_mask, min_glare_size=min_glare_size)
 
     if np.any(glare_mask):
-
         glare_mask_uint8 = (glare_mask.astype('uint8') * 255)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         glare_mask_dilated = cv2.dilate(glare_mask_uint8, kernel, iterations=2)
         glare_mask_soft = cv2.GaussianBlur(glare_mask_dilated, (15, 15), sigmaX=5.0, sigmaY=5.0)
         glare_mask_soft_norm = glare_mask_soft.astype('float32') / 255.0
 
-
         if mode == 'darken':
             arr_uint8 = np.clip(arr, 0, 255).astype('uint8')
             final = arr_uint8.copy().astype('float32')
-
             clahe_img = stm.apply_clahe(arr_uint8)
             final = stm.blend_enhancement(final, clahe_img, glare_mask_soft_norm, blend_factor=blend_factor)
 
@@ -93,42 +82,34 @@ def exposure_fix(img_bgr, mode='hybrid',
                 V_new[gamma_mask] = 255.0 * np.power((V_new[gamma_mask] / 255.0), float(gamma_exponent))
 
             S_enhanced = np.clip(S_chan * (1.0 + reduction * 0.3), 0, 255)
-
             hsv_darkened = np.stack([H, S_enhanced, V_new], axis=-1)
             final_rgb = cv2.cvtColor(np.clip(hsv_darkened, 0, 255).astype('uint8'),
                                      cv2.COLOR_HSV2RGB).astype('float32')
 
             min_allowed = 0.85 * orig_rgb
             final_rgb = np.maximum(final_rgb, min_allowed)
-
             final = final_rgb
         else:
-
             white_clip, colored_glare = stm.classify_glare_type(arr, glare_mask_soft_norm > 0.5)
-
             mode_map = np.zeros(arr.shape[:2], dtype='uint8')
             mode_map[colored_glare] = 1
             mode_map[white_clip] = 2
-
             final = stm.process_overexposed_hybrid(arr, glare_mask_soft_norm > 0.5, mode_map)
-
             if np.any(colored_glare):
                 colored_mask = colored_glare.astype('float32')
                 colored_smooth = cv2.GaussianBlur((colored_mask * 255).astype('uint8'), (15, 15), 5.0)
                 colored_smooth_norm = colored_smooth.astype('float32') / 255.0
                 final = final * colored_smooth_norm[..., None] + arr * (1.0 - colored_smooth_norm[..., None])
-
             if np.any(white_clip):
                 white_smooth = cv2.GaussianBlur((white_clip.astype('uint8') * 255), (15, 15), 5.0)
                 white_smooth_norm = white_smooth.astype('float32') / 255.0
                 final = final * white_smooth_norm[..., None] + arr * (1.0 - white_smooth_norm[..., None])
     else:
-
         final = arr.copy()
 
     final_rgb_0_1 = np.clip(final, 0, 255).astype('float32') / 255.0
-
     return final_rgb_0_1
+
 
 def _pad_to_pow2(img, levels):
     h, w = img.shape[:2]
@@ -173,9 +154,6 @@ def haar_idwt2_single(coeffs):
     return curA
 
 def fuse_luminance_wavelet_dcp_exp(img_dcp, img_exp, levels=5, base_chroma='exp'):
-    """
-    input dehaze and de-overexposure images (RGB) and output RGB fused image
-    """
     def to_uint8(bgr):
         if bgr.dtype == np.uint8:
             return bgr
@@ -186,7 +164,6 @@ def fuse_luminance_wavelet_dcp_exp(img_dcp, img_exp, levels=5, base_chroma='exp'
 
     lab_dcp = cv2.cvtColor(dcp_u8, cv2.COLOR_RGB2LAB)
     lab_exp = cv2.cvtColor(exp_u8, cv2.COLOR_RGB2LAB)
-
     L_dcp, a_dcp, b_dcp = cv2.split(lab_dcp)
     L_exp, a_exp, b_exp = cv2.split(lab_exp)
 
@@ -203,22 +180,16 @@ def fuse_luminance_wavelet_dcp_exp(img_dcp, img_exp, levels=5, base_chroma='exp'
         A2, H2, V2, D2 = (coeff_exp[l]['A'], coeff_exp[l]['H'],
                           coeff_exp[l]['V'], coeff_exp[l]['D'])
         Af = 0.5 * (A1 + A2)
-
         Hf = np.where(np.abs(H1) >= np.abs(H2), H1, H2)
         Vf = np.where(np.abs(V1) >= np.abs(V2), V1, V2)
         Df = np.where(np.abs(D1) >= np.abs(D2), D1, D2)
-
         coeff_fused.append({'A': Af, 'H': Hf, 'V': Vf, 'D': Df})
 
     L_fused = haar_idwt2_single(coeff_fused)
-
     H, W = L_dcp.shape
     L_fused = L_fused[:H, :W]
 
-
     L_fused_u8 = np.clip(L_fused, 0, 255).astype(np.uint8)
-
-
     if base_chroma == 'exp':
         a_base, b_base = a_exp, b_exp
     else:
@@ -226,81 +197,73 @@ def fuse_luminance_wavelet_dcp_exp(img_dcp, img_exp, levels=5, base_chroma='exp'
 
     lab_fused = cv2.merge((L_fused_u8, a_base, b_base))
     fused_rgb = cv2.cvtColor(lab_fused, cv2.COLOR_LAB2RGB)
+    return fused_rgb.astype(np.float32) / 255.0
 
-    fused_rgb = fused_rgb.astype(np.float32) / 255.0
-    return fused_rgb
 
 def resize(image, pixel_num = 1024*512):
     h, w = image.shape[:2]
     scale = (pixel_num / float(h * w)) ** 0.5
     new_h = max(1, int(round(h * scale)))
     new_w = max(1, int(round(w * scale)))
-
-    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return resized
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 def save_rgb_float01_as_bgr_uint8(path, rgb_float01):
-    """
-    rgb_float01: H×W×3, float32/float64 in [0,1]
-    path: output file path (Path or str)
-    """
     rgb_clipped = np.clip(rgb_float01 * 255.0, 0, 255).astype(np.uint8)
     bgr = cv2.cvtColor(rgb_clipped, cv2.COLOR_RGB2BGR)
-    path = str(path)
-    cv2.imwrite(path, bgr)
+    cv2.imwrite(str(path), bgr)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_dir', required=True, help='Directory with input images')
     parser.add_argument('--output_dir', required=True, help='Directory to save augmented images')
-    parser.add_argument('--fusion', type=str, choices=['yes', 'no'], required=True, help='Save the fusion or resize image')
-    parser.add_argument('--dehaze', type=str, choices=['dcp', 'hazeline'], help='method to dehaze', default='dcp')
+    parser.add_argument('--fusion', type=str, choices=['yes', 'no'], required=True, help='Save fusion or resize only')
+    parser.add_argument('--dehaze', type=str, choices=['dcp', 'hazeline'], default='dcp', help='Dehazing method')
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    exts = {'.jpg', '.JPG', '.jpeg', '.png', '.tif', '.bmp', '.webp'}
-
+    exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.webp'}
     files = [p for p in input_dir.iterdir() if p.suffix.lower() in exts]
     if not files:
         print('No images found in', input_dir)
+        return
 
     for p in files:
-        out_name = p.stem + ".webp"
-        out_path = output_dir / out_name
+        out_path = output_dir / (p.stem + ".webp")
         src = cv2.imread(str(p))
         resize_src = resize(src)
+
         if args.fusion == 'no':
             cv2.imwrite(str(out_path), resize_src)
             continue
+
         try:
+            # Dehaze
             if args.dehaze == 'dcp':
                 dehaze = DCP(resize_src)
                 dehaze = cv2.cvtColor(dehaze, cv2.COLOR_BGR2RGB)
             elif args.dehaze == 'hazeline':
                 dehaze, _ = haze_line(resize_src)
 
+            # Fix overexposure
             exposure_fixed = exposure_fix(resize_src)
-            fused = fuse_luminance_wavelet_dcp_exp(
-                dehaze,
-                exposure_fixed,
-                levels=5,
-                base_chroma='exp'
-            )
+
+            # Wavelet fusion
+            fused = fuse_luminance_wavelet_dcp_exp(dehaze, exposure_fixed, levels=5, base_chroma='exp')
+
             save_rgb_float01_as_bgr_uint8(out_path, fused)
 
-
+            # Optional visualization
             plt.subplot(2, 2, 1)
             plt.title("Original")
-            plt.imshow(exposure_fixed)
+            plt.imshow(cv2.cvtColor(resize_src, cv2.COLOR_BGR2RGB))
             plt.axis("off")
             plt.subplot(2, 2, 2)
             plt.title("Dehazed")
             plt.imshow(dehaze)
             plt.axis("off")
-            plt.tight_layout()
             plt.subplot(2, 2, 3)
             plt.title("De-overexposure")
             plt.imshow(exposure_fixed)
