@@ -218,6 +218,8 @@ def main():
     parser.add_argument('--output_dir', required=True, help='Directory to save augmented images')
     parser.add_argument('--fusion', type=str, choices=['yes', 'no'], required=True, help='Save fusion or resize only')
     parser.add_argument('--dehaze', type=str, choices=['dcp', 'hazeline'], default='dcp', help='Dehazing method')
+    parser.add_argument('--method', type=str, choices=['hybrid', 'retinex', 'gamma', 'tone'], default='hybrid', 
+                       help='Overexposure correction method to use')
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -247,8 +249,14 @@ def main():
             elif args.dehaze == 'hazeline':
                 dehaze, _ = haze_line(resize_src)
 
-            # Fix overexposure
-            exposure_fixed = exposure_fix(resize_src)
+            # Fix overexposure using the selected method
+            if args.method == 'hybrid':
+                # Use method5_hybrid directly for better results
+                exposure_fixed = stm.method5_hybrid(resize_src)
+                exposure_fixed = exposure_fixed.astype(np.float32) / 255.0
+            else:
+                # Use the original exposure_fix function
+                exposure_fixed = exposure_fix(resize_src, mode='hybrid')
 
             # Wavelet fusion
             fused = fuse_luminance_wavelet_dcp_exp(dehaze, exposure_fixed, levels=5, base_chroma='exp')
